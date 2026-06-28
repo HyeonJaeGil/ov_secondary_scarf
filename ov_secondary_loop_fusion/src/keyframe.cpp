@@ -491,13 +491,20 @@ void KeyFrame::PnPRANSAC(const vector<cv::Point2f> &matched_2d_old_norm,
 }
 
 
-bool KeyFrame::findConnection(KeyFrame* old_kf, int *loop_feat_num)
+LoopProposal KeyFrame::evaluateLoopConnection(KeyFrame* old_kf, const std::string &method_name)
 {
-    if (loop_feat_num != nullptr)
-        *loop_feat_num = 0;
+    LoopProposal proposal;
+    proposal.method_name = method_name;
+    proposal.metrics["min_loop_num"] = MIN_LOOP_NUM;
+    proposal.metrics["max_theta_diff_deg"] = MAX_THETA_DIFF;
+    proposal.metrics["max_pos_diff_m"] = MAX_POS_DIFF;
 
     if (old_kf == nullptr)
-        return false;
+    {
+        proposal.reject_reason = "target_keyframe_not_found";
+        return proposal;
+    }
+    proposal.target_keyframe_index = old_kf->index;
 
 	TicToc tmp_t;
 	//printf("[POSEGRAPH]: find Connection\n");
@@ -554,9 +561,10 @@ bool KeyFrame::findConnection(KeyFrame* old_kf, int *loop_feat_num)
     const vector<cv::Point2f> tentative_2d_cur = matched_2d_cur;
     const vector<cv::Point2f> tentative_2d_old = matched_2d_old;
     const vector<cv::Point2f> tentative_2d_cur_norm = matched_2d_cur_norm;
-    const vector<cv::Point2f> tentative_2d_old_norm = matched_2d_old_norm;
+	const vector<cv::Point2f> tentative_2d_old_norm = matched_2d_old_norm;
     const vector<cv::Point3f> tentative_3d = matched_3d;
     const vector<double> tentative_id = matched_id;
+    proposal.metrics["tentative_match_count"] = static_cast<double>(tentative_2d_cur.size());
 
 	#if 0 
 		if (DEBUG_IMAGE)
@@ -713,15 +721,16 @@ bool KeyFrame::findConnection(KeyFrame* old_kf, int *loop_feat_num)
 	        }
 	    #endif
 	}
+    proposal.metrics["pnp_evaluated"] = pnp_evaluated ? 1.0 : 0.0;
+    proposal.metrics["pnp_inlier_count"] = static_cast<double>(matched_2d_cur.size());
 
 	if ((int)matched_2d_cur.size() > MIN_LOOP_NUM)
 	{
-        if (loop_feat_num != nullptr)
-            *loop_feat_num = static_cast<int>(matched_2d_cur.size());
-
 	    relative_t = PnP_R_old.transpose() * (origin_vio_T - PnP_T_old);
 	    relative_q = PnP_R_old.transpose() * origin_vio_R;
 	    relative_yaw = Utility::normalizeAngle(Utility::R2ypr(origin_vio_R).x() - Utility::R2ypr(PnP_R_old).x());
+        proposal.metrics["relative_t_norm"] = relative_t.norm();
+        proposal.metrics["relative_yaw_deg"] = relative_yaw;
 	    //printf("[POSEGRAPH]: PNP relative\n");
 	    //cout << "pnp relative_t " << relative_t.transpose() << endl;
 	    //cout << "pnp relative_yaw " << relative_yaw << endl;
@@ -734,14 +743,13 @@ bool KeyFrame::findConnection(KeyFrame* old_kf, int *loop_feat_num)
                                     pnp_status, pnp_evaluated,
                                     relative_t.norm(), relative_yaw, true);
 
-	    	has_loop = true;
-	    	loop_index = old_kf->index;
-	    	loop_info << relative_t.x(), relative_t.y(), relative_t.z(),
-	    	             relative_q.w(), relative_q.x(), relative_q.y(), relative_q.z(),
-	    	             relative_yaw;
+            proposal.status = LoopProposal::Status::Accepted;
+            proposal.reject_reason.clear();
+            proposal.confidence = static_cast<double>(matched_2d_cur.size());
+            proposal.relative_pose = LoopRelativePose{relative_t, relative_q, relative_yaw};
 	    	//cout << "pnp relative_t " << relative_t.transpose() << endl;
 	    	//cout << "pnp relative_q " << relative_q.w() << " " << relative_q.vec().transpose() << endl;
-	        return true;
+	        return proposal;
 	    }
         WriteLoopDebugCandidate(*this, *old_kf,
                                 tentative_2d_cur, tentative_2d_old,
@@ -749,7 +757,8 @@ bool KeyFrame::findConnection(KeyFrame* old_kf, int *loop_feat_num)
                                 tentative_3d, tentative_id,
                                 pnp_status, pnp_evaluated,
                                 relative_t.norm(), relative_yaw, false);
-        return false;
+        proposal.reject_reason = "geometry_threshold";
+        return proposal;
 	}
     WriteLoopDebugCandidate(*this, *old_kf,
                             tentative_2d_cur, tentative_2d_old,
@@ -758,7 +767,21 @@ bool KeyFrame::findConnection(KeyFrame* old_kf, int *loop_feat_num)
                             pnp_status, pnp_evaluated,
                             0.0, 0.0, false);
 	//printf("[POSEGRAPH]: loop final use num %d %lf--------------- \n", (int)matched_2d_cur.size(), t_match.toc());
-	return false;
+    proposal.reject_reason = pnp_evaluated ? "pnp_inliers_below_threshold" : "tentative_matches_below_threshold";
+	return proposal;
+}
+
+void KeyFrame::applyLoopProposal(const LoopProposal &proposal)
+{
+    if (!proposal.accepted() || !proposal.relative_pose)
+        return;
+
+    has_loop = true;
+    loop_index = proposal.target_keyframe_index;
+    const LoopRelativePose &relative_pose = *proposal.relative_pose;
+    loop_info << relative_pose.translation.x(), relative_pose.translation.y(), relative_pose.translation.z(),
+                 relative_pose.rotation.w(), relative_pose.rotation.x(), relative_pose.rotation.y(), relative_pose.rotation.z(),
+                 relative_pose.yaw_degrees;
 }
 
 

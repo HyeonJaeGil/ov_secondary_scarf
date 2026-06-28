@@ -23,6 +23,7 @@
 #include "utility/utility.h"
 #include "utility/Grider_FAST.h"
 #include "parameters.h"
+#include "loop_proposal.h"
 #include "ThirdParty/DBoW/DBoW2.h"
 #include "ThirdParty/DVision/DVision.h"
 
@@ -52,7 +53,8 @@ public:
 			 vector<cv::KeyPoint> &_keypoints, vector<cv::KeyPoint> &_keypoints_norm, vector<BRIEF::bitset> &_brief_descriptors,
 			 const Vector3d &_T_i_c, const Matrix3d &_R_i_c,
 			 const camodocal::CameraPtr &_camera);
-	bool findConnection(KeyFrame* old_kf, int *loop_feat_num = nullptr);
+	LoopProposal evaluateLoopConnection(KeyFrame* old_kf, const std::string &method_name);
+	void applyLoopProposal(const LoopProposal &proposal);
 	void computeWindowBRIEFPoint();
 	void computeBRIEFPoint();
 	//void extractBrief();

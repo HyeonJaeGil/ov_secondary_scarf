@@ -13,6 +13,7 @@
 
 #include <atomic>
 #include <map>
+#include <optional>
 #include <thread>
 #include <mutex>
 #include <opencv2/opencv.hpp>
@@ -81,7 +82,8 @@ private:
 		FullCalibration
 	};
 
-	int detectLoop(KeyFrame* keyframe, int frame_index, int *loop_inlier_count = nullptr);
+	std::vector<LoopProposal> detectLoop(KeyFrame* keyframe, int frame_index);
+	std::optional<LoopProposal> selectTopAcceptedLoopProposal(const std::vector<LoopProposal> &proposals) const;
 	void addKeyFrameIntoVoc(KeyFrame* keyframe);
 	bool prepareOptimizationRequest(int &cur_index, int &first_looped_index,
 	                                bool &global_optimization,

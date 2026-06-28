@@ -191,20 +191,24 @@ void PoseGraph::addKeyFrame(KeyFrame* cur_kf, bool flag_detect_loop)
     cur_kf->updateVioPose(vio_P_cur, vio_R_cur);
     cur_kf->index = global_index;
     global_index++;
-	int loop_index = -1;
-    int loop_inlier_count = 0;
+    std::optional<LoopProposal> selected_loop_proposal;
     bool enqueue_optimization = false;
     if (flag_detect_loop)
     {
         TicToc tmp_t;
-        loop_index = detectLoop(cur_kf, cur_kf->index, &loop_inlier_count);
+        selected_loop_proposal = selectTopAcceptedLoopProposal(detectLoop(cur_kf, cur_kf->index));
     }
     else
     {
         addKeyFrameIntoVoc(cur_kf);
     }
-	if (loop_index != -1)
+	if (selected_loop_proposal)
 	{
+        const LoopProposal &proposal = *selected_loop_proposal;
+        const int loop_index = proposal.target_keyframe_index;
+        const int loop_inlier_count = static_cast<int>(proposal.metrics.count("pnp_inlier_count")
+                                                           ? proposal.metrics.at("pnp_inlier_count")
+                                                           : proposal.confidence);
         printf("[POSEGRAPH]:  %d detect loop with %d (%d inliers)\n",
                cur_kf->index, loop_index, loop_inlier_count);
         KeyFrame* old_kf = getKeyFrame(loop_index);
@@ -213,8 +217,9 @@ void PoseGraph::addKeyFrame(KeyFrame* cur_kf, bool flag_detect_loop)
             printf("[POSEGRAPH]: reject loop candidate %d for keyframe %d: keyframe not found\n",
                    loop_index, cur_kf->index);
         }
-        else if ((cur_kf->has_loop && loop_index == old_kf->index) || cur_kf->findConnection(old_kf))
+        else
         {
+            cur_kf->applyLoopProposal(proposal);
             if (earliest_loop_index > loop_index || earliest_loop_index == -1)
                 earliest_loop_index = loop_index;
 
@@ -225,8 +230,8 @@ void PoseGraph::addKeyFrame(KeyFrame* cur_kf, bool flag_detect_loop)
 
             Vector3d relative_t;
             Quaterniond relative_q;
-            relative_t = cur_kf->getLoopRelativeT();
-            relative_q = (cur_kf->getLoopRelativeQ()).toRotationMatrix();
+            relative_t = proposal.relative_pose->translation;
+            relative_q = proposal.relative_pose->rotation.toRotationMatrix();
             w_P_cur = w_R_old * relative_t + w_P_old;
             w_R_cur = w_R_old * relative_q;
             double shift_yaw;
@@ -315,17 +320,21 @@ void PoseGraph::loadKeyFrame(KeyFrame* cur_kf, bool flag_detect_loop)
 {
     cur_kf->index = global_index;
     global_index++;
-    int loop_index = -1;
-    int loop_inlier_count = 0;
+    std::optional<LoopProposal> selected_loop_proposal;
     bool enqueue_optimization = false;
     if (flag_detect_loop)
-       loop_index = detectLoop(cur_kf, cur_kf->index, &loop_inlier_count);
+       selected_loop_proposal = selectTopAcceptedLoopProposal(detectLoop(cur_kf, cur_kf->index));
     else
     {
         addKeyFrameIntoVoc(cur_kf);
     }
-    if (loop_index != -1)
+    if (selected_loop_proposal)
     {
+        const LoopProposal &proposal = *selected_loop_proposal;
+        const int loop_index = proposal.target_keyframe_index;
+        const int loop_inlier_count = static_cast<int>(proposal.metrics.count("pnp_inlier_count")
+                                                           ? proposal.metrics.at("pnp_inlier_count")
+                                                           : proposal.confidence);
         printf("[POSEGRAPH]:  %d detect loop with %d (%d inliers)\n",
                cur_kf->index, loop_index, loop_inlier_count);
         KeyFrame* old_kf = getKeyFrame(loop_index);
@@ -334,8 +343,9 @@ void PoseGraph::loadKeyFrame(KeyFrame* cur_kf, bool flag_detect_loop)
             printf("[POSEGRAPH]: reject loop candidate %d for keyframe %d: keyframe not found\n",
                    loop_index, cur_kf->index);
         }
-        else if (cur_kf->findConnection(old_kf))
+        else
         {
+            cur_kf->applyLoopProposal(proposal);
             if (earliest_loop_index > loop_index || earliest_loop_index == -1)
                 earliest_loop_index = loop_index;
             enqueue_optimization = true;
@@ -385,10 +395,25 @@ KeyFrame* PoseGraph::getKeyFrame(int index)
         return NULL;
 }
 
-int PoseGraph::detectLoop(KeyFrame* keyframe, int frame_index, int *loop_inlier_count)
+std::optional<LoopProposal> PoseGraph::selectTopAcceptedLoopProposal(const std::vector<LoopProposal> &proposals) const
 {
-    if (loop_inlier_count != nullptr)
-        *loop_inlier_count = 0;
+    std::optional<LoopProposal> selected;
+    for (const LoopProposal &proposal : proposals)
+    {
+        if (!proposal.accepted() || !proposal.relative_pose)
+            continue;
+        if (!selected || proposal.rank < selected->rank ||
+            (proposal.rank == selected->rank && proposal.confidence > selected->confidence))
+        {
+            selected = proposal;
+        }
+    }
+    return selected;
+}
+
+std::vector<LoopProposal> PoseGraph::detectLoop(KeyFrame* keyframe, int frame_index)
+{
+    std::vector<LoopProposal> proposals;
 
     // put image into image_pool; for visualization
     cv::Mat compressed_image;
@@ -446,24 +471,50 @@ int PoseGraph::detectLoop(KeyFrame* keyframe, int frame_index, int *loop_inlier_
 */
     //if (find_loop && frame_index > 50)
     if (frame_index < 50)
-        return -1;
+        return proposals;
 
     struct LoopCandidate
     {
         int index;
         double timestamp;
+        int retrieval_rank;
+        double dbow_score;
     };
     std::vector<LoopCandidate> candidates;
     candidates.reserve(ret.size());
     for (unsigned int i = 0; i < ret.size(); i++)
     {
         const int candidate_index = static_cast<int>(ret[i].Id);
-        if (candidate_index >= max_frame_id_allowed || ret[i].Score <= MIN_SCORE)
+        LoopProposal proposal;
+        proposal.target_keyframe_index = candidate_index;
+        proposal.rank = static_cast<int>(i);
+        proposal.confidence = ret[i].Score;
+        proposal.method_name = "DBoW+PnP";
+        proposal.metrics["dbow_score"] = ret[i].Score;
+        proposal.metrics["retrieval_rank"] = static_cast<double>(i);
+        proposal.metrics["max_frame_id_allowed"] = max_frame_id_allowed;
+        proposal.metrics["min_score"] = MIN_SCORE;
+
+        if (candidate_index >= max_frame_id_allowed)
+        {
+            proposal.reject_reason = "recent_keyframe";
+            proposals.push_back(proposal);
             continue;
+        }
+        if (ret[i].Score <= MIN_SCORE)
+        {
+            proposal.reject_reason = "dbow_score_below_threshold";
+            proposals.push_back(proposal);
+            continue;
+        }
         KeyFrame* old_kf = getKeyFrame(candidate_index);
         if (old_kf == nullptr)
+        {
+            proposal.reject_reason = "target_keyframe_not_found";
+            proposals.push_back(proposal);
             continue;
-        candidates.push_back({candidate_index, HeaderStampSeconds(old_kf->header_stamp)});
+        }
+        candidates.push_back({candidate_index, HeaderStampSeconds(old_kf->header_stamp), static_cast<int>(i), ret[i].Score});
     }
     std::sort(candidates.begin(), candidates.end(),
               [](const LoopCandidate &a, const LoopCandidate &b)
@@ -473,58 +524,58 @@ int PoseGraph::detectLoop(KeyFrame* keyframe, int frame_index, int *loop_inlier_
                   return a.timestamp < b.timestamp;
               });
 
-    struct LoopMatch
-    {
-        int index = -1;
-        int loop_feat_num = 0;
-        Eigen::Matrix<double, 8, 1> loop_info = Eigen::Matrix<double, 8, 1>::Zero();
-    };
-
     const double strong_loop_feat_num = MIN_LOOP_NUM * 1.5;
     const int max_weak_loop_candidates = 3;
-    LoopMatch best_weak_match;
+    std::optional<size_t> best_weak_match;
     int weak_loop_candidates = 0;
 
     for (const LoopCandidate &candidate : candidates)
     {
         KeyFrame* old_kf = getKeyFrame(candidate.index);
-        int loop_feat_num = 0;
-        if(old_kf == nullptr || !keyframe->findConnection(old_kf, &loop_feat_num))
+        LoopProposal proposal = keyframe->evaluateLoopConnection(old_kf, "DBoW+PnP");
+        proposal.rank = candidate.retrieval_rank;
+        proposal.metrics["dbow_score"] = candidate.dbow_score;
+        proposal.metrics["retrieval_rank"] = static_cast<double>(candidate.retrieval_rank);
+        proposal.metrics["strong_loop_inlier_threshold"] = strong_loop_feat_num;
+        proposal.metrics["max_weak_loop_candidates"] = max_weak_loop_candidates;
+
+        const double loop_feat_num = proposal.metrics.count("pnp_inlier_count")
+                                         ? proposal.metrics["pnp_inlier_count"]
+                                         : proposal.confidence;
+        proposals.push_back(proposal);
+        const size_t proposal_index = proposals.size() - 1;
+
+        if (!proposal.accepted())
             continue;
 
         if (loop_feat_num > strong_loop_feat_num)
         {
-            if (loop_inlier_count != nullptr)
-                *loop_inlier_count = loop_feat_num;
-            return candidate.index;
+            proposals[proposal_index].rank = 0;
+            return proposals;
         }
 
         if (loop_feat_num > MIN_LOOP_NUM)
         {
             weak_loop_candidates++;
-            if (loop_feat_num > best_weak_match.loop_feat_num)
-            {
-                best_weak_match.index = candidate.index;
-                best_weak_match.loop_feat_num = loop_feat_num;
-                best_weak_match.loop_info = keyframe->loop_info;
-            }
+            if (!best_weak_match ||
+                loop_feat_num > proposals[*best_weak_match].metrics["pnp_inlier_count"])
+                best_weak_match = proposal_index;
             if (weak_loop_candidates >= max_weak_loop_candidates)
                 break;
         }
     }
 
-    if (best_weak_match.index != -1)
+    if (best_weak_match)
     {
-        keyframe->has_loop = true;
-        keyframe->loop_index = best_weak_match.index;
-        keyframe->loop_info = best_weak_match.loop_info;
-        if (loop_inlier_count != nullptr)
-            *loop_inlier_count = best_weak_match.loop_feat_num;
-        return best_weak_match.index;
+        proposals[*best_weak_match].rank = 0;
+        for (size_t i = 0; i < proposals.size(); i++)
+        {
+            if (i != *best_weak_match && proposals[i].accepted())
+                proposals[i].rank = std::max(proposals[i].rank, 1);
+        }
     }
 
-    // failure
-    return -1;
+    return proposals;
 }
 
 void PoseGraph::addKeyFrameIntoVoc(KeyFrame* keyframe)
