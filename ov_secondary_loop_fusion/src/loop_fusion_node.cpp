@@ -81,6 +81,9 @@ int VISUALIZATION_SHIFT_Y;
 int ROW;
 int COL;
 int DEBUG_IMAGE;
+int LOOP_DEBUG_ENABLE = 0;
+int LOOP_DEBUG_INTER_SESSION_ONLY = 1;
+int LOOP_DEBUG_MAX_CANDIDATES = 0;
 
 camodocal::CameraPtr m_camera;
 double max_focallength = 460.0;
@@ -93,6 +96,7 @@ std::string OUTPUT_PATH;
 std::string TRAJECTORY_BAG_TOPIC = "/ov_slam/trajectory";
 std::string ODOMETRY_BAG_TOPIC = "/ov_slam/odometry";
 std::string IMAGE_BAG_TOPIC = "/ov_slam/image/compressed";
+std::string LOOP_DEBUG_OUTPUT_PATH;
 Eigen::Vector3d last_t(-100, -100, -100);
 double last_image_time = -1;
 double image_stream_start_time = -1;
@@ -666,6 +670,14 @@ int main(int argc, char **argv)
         fsSettings["odometry_bag_topic"] >> ODOMETRY_BAG_TOPIC;
     if (!fsSettings["image_bag_topic"].empty())
         fsSettings["image_bag_topic"] >> IMAGE_BAG_TOPIC;
+    if (!fsSettings["loop_debug_enable"].empty())
+        fsSettings["loop_debug_enable"] >> LOOP_DEBUG_ENABLE;
+    if (!fsSettings["loop_debug_inter_session_only"].empty())
+        fsSettings["loop_debug_inter_session_only"] >> LOOP_DEBUG_INTER_SESSION_ONLY;
+    if (!fsSettings["loop_debug_max_candidates"].empty())
+        fsSettings["loop_debug_max_candidates"] >> LOOP_DEBUG_MAX_CANDIDATES;
+    if (!fsSettings["loop_debug_output_path"].empty())
+        fsSettings["loop_debug_output_path"] >> LOOP_DEBUG_OUTPUT_PATH;
     fsSettings["skip_dist"] >> SKIP_DIS;
     fsSettings["skip_cnt"] >> SKIP_CNT;
     if (!fsSettings["skip_first_seconds"].empty())
@@ -717,6 +729,10 @@ int main(int argc, char **argv)
     if (POSE_GRAPH_SAVE_PATH.back() != '/')
         POSE_GRAPH_SAVE_PATH += "/";
     initialize_bag_writer((ov_slam_output_path / "ov_slam_bag").string());
+    if (LOOP_DEBUG_ENABLE && LOOP_DEBUG_OUTPUT_PATH.empty())
+        LOOP_DEBUG_OUTPUT_PATH = (ov_slam_output_path / "loop_debug_actual").string();
+    if (!LOOP_DEBUG_OUTPUT_PATH.empty())
+        printf("[POSEGRAPH]: loop debug output path: %s\n", LOOP_DEBUG_OUTPUT_PATH.c_str());
     printf("[POSEGRAPH]: writing trajectory bag: %s\n", (ov_slam_output_path / "ov_slam_bag").string().c_str());
 
     int LOAD_PREVIOUS_POSE_GRAPH;

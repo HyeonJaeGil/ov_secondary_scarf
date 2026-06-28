@@ -45,6 +45,10 @@ extern std::string TRAJECTORY_BAG_TOPIC;
 extern std::string ODOMETRY_BAG_TOPIC;
 extern std::string IMAGE_BAG_TOPIC;
 extern int DEBUG_IMAGE;
+extern int LOOP_DEBUG_ENABLE;
+extern int LOOP_DEBUG_INTER_SESSION_ONLY;
+extern int LOOP_DEBUG_MAX_CANDIDATES;
+extern std::string LOOP_DEBUG_OUTPUT_PATH;
 
 void initialize_bag_writer(const std::string &bag_path);
 void close_bag_writer();

@@ -12,6 +12,10 @@
 #include "keyframe.h"
 #include <algorithm>
 #include <cmath>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <mutex>
 
 namespace {
 
@@ -83,6 +87,120 @@ void NormalizeKeypointVector(const camodocal::CameraPtr &source,
         normalized_keypoint.pt = LiftToNormalizedPoint(source, keypoint.pt);
         normalized.push_back(normalized_keypoint);
     }
+}
+
+std::mutex loop_debug_mutex;
+int loop_debug_saved_candidates = 0;
+bool loop_debug_manifest_header_written = false;
+
+std::string LoopDebugReason(bool pnp_evaluated,
+                            int tentative_count,
+                            int pnp_inlier_count,
+                            bool geometry_pass)
+{
+    if (geometry_pass)
+        return "accepted";
+    if (tentative_count <= MIN_LOOP_NUM)
+        return "tentative_le_min_loop";
+    if (!pnp_evaluated)
+        return "pnp_not_evaluated";
+    if (pnp_inlier_count <= MIN_LOOP_NUM)
+        return "pnp_le_min_loop";
+    return "geometry_rejected";
+}
+
+void WriteLoopDebugCandidate(const KeyFrame &cur_kf,
+                             const KeyFrame &old_kf,
+                             const std::vector<cv::Point2f> &tentative_cur,
+                             const std::vector<cv::Point2f> &tentative_old,
+                             const std::vector<cv::Point2f> &tentative_cur_norm,
+                             const std::vector<cv::Point2f> &tentative_old_norm,
+                             const std::vector<cv::Point3f> &tentative_3d,
+                             const std::vector<double> &tentative_id,
+                             const std::vector<uchar> &pnp_status,
+                             bool pnp_evaluated,
+                             double relative_t_norm,
+                             double relative_yaw,
+                             bool geometry_pass)
+{
+    if (!LOOP_DEBUG_ENABLE)
+        return;
+    if (LOOP_DEBUG_INTER_SESSION_ONLY && cur_kf.sequence == old_kf.sequence)
+        return;
+
+    std::lock_guard<std::mutex> lock(loop_debug_mutex);
+    if (LOOP_DEBUG_MAX_CANDIDATES > 0 &&
+        loop_debug_saved_candidates >= LOOP_DEBUG_MAX_CANDIDATES)
+        return;
+
+    const std::filesystem::path output_dir(
+        LOOP_DEBUG_OUTPUT_PATH.empty()
+            ? (std::filesystem::path(OUTPUT_PATH) / "ov_slam" / "loop_debug_actual")
+            : std::filesystem::path(LOOP_DEBUG_OUTPUT_PATH));
+    std::filesystem::create_directories(output_dir);
+
+    const int rank = loop_debug_saved_candidates + 1;
+    int pnp_inlier_count = 0;
+    if (pnp_evaluated)
+    {
+        for (uchar value : pnp_status)
+            if (value)
+                pnp_inlier_count++;
+    }
+    const std::string reason = LoopDebugReason(
+        pnp_evaluated, static_cast<int>(tentative_cur.size()), pnp_inlier_count, geometry_pass);
+
+    std::ostringstream stem;
+    stem << std::setw(4) << std::setfill('0') << rank
+         << "_cur" << cur_kf.index
+         << "_old" << old_kf.index
+         << "_tent" << tentative_cur.size()
+         << "_pnp" << pnp_inlier_count;
+
+    const std::filesystem::path matches_path = output_dir / (stem.str() + "_matches.csv");
+    std::ofstream matches(matches_path);
+    matches << "match_id,cur_x,cur_y,old_x,old_y,cur_norm_x,cur_norm_y,"
+               "old_norm_x,old_norm_y,point3d_x,point3d_y,point3d_z,point_id,pnp_status\n";
+    for (size_t i = 0; i < tentative_cur.size(); i++)
+    {
+        const int status = pnp_evaluated && i < pnp_status.size()
+                               ? static_cast<int>(pnp_status[i])
+                               : -1;
+        matches << i << ","
+                << tentative_cur[i].x << "," << tentative_cur[i].y << ","
+                << tentative_old[i].x << "," << tentative_old[i].y << ","
+                << tentative_cur_norm[i].x << "," << tentative_cur_norm[i].y << ","
+                << tentative_old_norm[i].x << "," << tentative_old_norm[i].y << ","
+                << tentative_3d[i].x << "," << tentative_3d[i].y << "," << tentative_3d[i].z << ","
+                << tentative_id[i] << "," << status << "\n";
+    }
+
+    const std::filesystem::path manifest_path = output_dir / "manifest.csv";
+    std::ofstream manifest(manifest_path, std::ios::app);
+    if (!loop_debug_manifest_header_written)
+    {
+        manifest << "rank,cur_index,old_index,cur_sequence,old_sequence,"
+                    "cur_stamp_sec,cur_stamp_nsec,old_stamp_sec,old_stamp_nsec,"
+                    "tentative_count,pnp_evaluated,pnp_inlier_count,min_loop_num,"
+                    "relative_t_norm,relative_yaw,geometry_pass,reason,matches_file\n";
+        loop_debug_manifest_header_written = true;
+    }
+    manifest << rank << ","
+             << cur_kf.index << "," << old_kf.index << ","
+             << cur_kf.sequence << "," << old_kf.sequence << ","
+             << cur_kf.header_stamp.sec << "," << cur_kf.header_stamp.nanosec << ","
+             << old_kf.header_stamp.sec << "," << old_kf.header_stamp.nanosec << ","
+             << tentative_cur.size() << ","
+             << (pnp_evaluated ? 1 : 0) << ","
+             << pnp_inlier_count << ","
+             << MIN_LOOP_NUM << ","
+             << relative_t_norm << ","
+             << relative_yaw << ","
+             << (geometry_pass ? 1 : 0) << ","
+             << reason << ","
+             << matches_path.filename().string() << "\n";
+
+    loop_debug_saved_candidates++;
 }
 
 }  // namespace
@@ -433,6 +551,13 @@ bool KeyFrame::findConnection(KeyFrame* old_kf, int *loop_feat_num)
 	reduceVector(matched_id, status);
 	//printf("[POSEGRAPH]: search by des finish\n");
 
+    const vector<cv::Point2f> tentative_2d_cur = matched_2d_cur;
+    const vector<cv::Point2f> tentative_2d_old = matched_2d_old;
+    const vector<cv::Point2f> tentative_2d_cur_norm = matched_2d_cur_norm;
+    const vector<cv::Point2f> tentative_2d_old_norm = matched_2d_old_norm;
+    const vector<cv::Point3f> tentative_3d = matched_3d;
+    const vector<double> tentative_id = matched_id;
+
 	#if 0 
 		if (DEBUG_IMAGE)
 	    {
@@ -529,12 +654,16 @@ bool KeyFrame::findConnection(KeyFrame* old_kf, int *loop_feat_num)
 	Eigen::Vector3d relative_t;
 	Quaterniond relative_q;
 	double relative_yaw;
+    vector<uchar> pnp_status;
+    bool pnp_evaluated = false;
 	if ((int)matched_2d_cur.size() > MIN_LOOP_NUM)
 	{
 		status.clear();
 	    PnPRANSAC(matched_2d_old_norm, matched_3d, status, PnP_T_old, PnP_R_old,
 	              old_kf->T_i_c, old_kf->R_i_c, old_kf->hasFixedCalibration(),
 	              old_kf->getMaxFocalLength());
+        pnp_status = status;
+        pnp_evaluated = true;
 	    reduceVector(matched_2d_cur, status);
 	    reduceVector(matched_2d_old, status);
 	    reduceVector(matched_2d_cur_norm, status);
@@ -598,6 +727,12 @@ bool KeyFrame::findConnection(KeyFrame* old_kf, int *loop_feat_num)
 	    //cout << "pnp relative_yaw " << relative_yaw << endl;
 	    if (abs(relative_yaw) < MAX_THETA_DIFF && relative_t.norm() < MAX_POS_DIFF)
 	    {
+            WriteLoopDebugCandidate(*this, *old_kf,
+                                    tentative_2d_cur, tentative_2d_old,
+                                    tentative_2d_cur_norm, tentative_2d_old_norm,
+                                    tentative_3d, tentative_id,
+                                    pnp_status, pnp_evaluated,
+                                    relative_t.norm(), relative_yaw, true);
 
 	    	has_loop = true;
 	    	loop_index = old_kf->index;
@@ -608,7 +743,20 @@ bool KeyFrame::findConnection(KeyFrame* old_kf, int *loop_feat_num)
 	    	//cout << "pnp relative_q " << relative_q.w() << " " << relative_q.vec().transpose() << endl;
 	        return true;
 	    }
+        WriteLoopDebugCandidate(*this, *old_kf,
+                                tentative_2d_cur, tentative_2d_old,
+                                tentative_2d_cur_norm, tentative_2d_old_norm,
+                                tentative_3d, tentative_id,
+                                pnp_status, pnp_evaluated,
+                                relative_t.norm(), relative_yaw, false);
+        return false;
 	}
+    WriteLoopDebugCandidate(*this, *old_kf,
+                            tentative_2d_cur, tentative_2d_old,
+                            tentative_2d_cur_norm, tentative_2d_old_norm,
+                            tentative_3d, tentative_id,
+                            pnp_status, pnp_evaluated,
+                            0.0, 0.0, false);
 	//printf("[POSEGRAPH]: loop final use num %d %lf--------------- \n", (int)matched_2d_cur.size(), t_match.toc());
 	return false;
 }
