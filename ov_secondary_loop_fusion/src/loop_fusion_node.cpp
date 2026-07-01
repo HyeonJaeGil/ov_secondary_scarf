@@ -811,8 +811,7 @@ int main(int argc, char **argv)
     RCLCPP_INFO_STREAM(nh->get_logger(), "loop_fusion_node ready");
     rclcpp::spin(nh);
     m_process.lock();
-    refresh_calibration_for_output();
-    write_final_trajectory_outputs();
+    save_pose_graph_outputs(true);
     m_process.unlock();
     close_bag_writer();
 
