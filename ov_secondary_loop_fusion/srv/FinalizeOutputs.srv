@@ -1,0 +1,10 @@
+bool run_final_optimization
+float64 timeout_sec
+bool shutdown_after_finalize
+---
+bool success
+string message
+string pose_graph_path
+string bag_path
+string metadata_path
+string final_trajectory_path

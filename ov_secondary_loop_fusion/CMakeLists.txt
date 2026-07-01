@@ -18,9 +18,14 @@ find_package(visualization_msgs REQUIRED)
 find_package(ament_index_cpp REQUIRED)
 find_package(ov_secondary_camera_models REQUIRED)
 find_package(rosbag2_cpp REQUIRED)
+find_package(rosidl_default_generators REQUIRED)
 
 
 include_directories(include ${CERES_INCLUDE_DIRS}  ${EIGEN3_INCLUDE_DIR})
+
+rosidl_generate_interfaces(${PROJECT_NAME}
+  "srv/FinalizeOutputs.srv"
+)
 
 add_executable(loop_fusion_node
     src/loop_fusion_node.cpp
@@ -39,6 +44,11 @@ add_executable(loop_fusion_node
     )
 
 target_link_libraries(loop_fusion_node ${catkin_LIBRARIES}  ${OpenCV_LIBS} ${CERES_LIBRARIES}) 
+rosidl_get_typesupport_target(cpp_typesupport_target
+  ${PROJECT_NAME}
+  "rosidl_typesupport_cpp"
+)
+target_link_libraries(loop_fusion_node "${cpp_typesupport_target}")
 
 
 install(
@@ -56,6 +66,7 @@ ament_target_dependencies(loop_fusion_node
   rclcpp
   builtin_interfaces
   nav_msgs
+  std_msgs
   sensor_msgs
   visualization_msgs
   cv_bridge
@@ -63,4 +74,5 @@ ament_target_dependencies(loop_fusion_node
   ov_secondary_camera_models
   rosbag2_cpp
 )
+ament_export_dependencies(rosidl_default_runtime)
 ament_package()
