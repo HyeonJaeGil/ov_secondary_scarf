@@ -314,12 +314,18 @@ FinalizeResult finalize_ov_slam_outputs(
     bool close_bag,
     double timeout_sec)
 {
-    std::unique_lock<std::mutex> finalize_lock(finalize_mutex);
     FinalizeResult result;
     result.pose_graph_path = pose_graph_txt_path();
     result.bag_path = ov_slam_bag_path();
     result.metadata_path = ov_slam_metadata_path();
     result.final_trajectory_path = final_trajectory_tum_path();
+
+    std::unique_lock<std::mutex> finalize_lock(finalize_mutex, std::try_to_lock);
+    if (!finalize_lock.owns_lock())
+    {
+        result.message = "OV-SLAM output finalization already in progress";
+        return result;
+    }
 
     if (outputs_finalized)
     {
@@ -328,7 +334,6 @@ FinalizeResult finalize_ov_slam_outputs(
         return result;
     }
 
-    finalize_lock.unlock();
     std::string finalization_note;
     clear_unmatched_serial_input_tail();
     if (timeout_sec > 0.0 && !wait_for_input_queues_empty(timeout_sec))
@@ -375,7 +380,6 @@ FinalizeResult finalize_ov_slam_outputs(
         return result;
     }
 
-    finalize_lock.lock();
     if (close_bag)
         outputs_finalized = true;
     result.success = true;
