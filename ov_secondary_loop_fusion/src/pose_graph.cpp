@@ -11,6 +11,7 @@
 
 #include "pose_graph.h"
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
@@ -25,6 +26,8 @@
 
 
 namespace {
+
+constexpr size_t kMaxRejectedLoopVisualizationRecords = 2000;
 
 nav_msgs::msg::Path BuildCameraTrajectoryMessage(const std::list<KeyFrame*> &keyframes)
 {
@@ -97,6 +100,21 @@ geometry_msgs::msg::Point KeyFrameCameraPoint(KeyFrame *keyframe)
     return ToPointMsg(position);
 }
 
+std::string LoopVisualizationRejectReason(const LoopProposal &proposal)
+{
+    if (proposal.reject_reason == "dbow_score_below_threshold")
+        return "low_confidence";
+    if (proposal.reject_reason == "pnp_inliers_below_threshold")
+        return "low_inliers";
+    if (proposal.reject_reason == "tentative_matches_below_threshold")
+        return "pnp_failed";
+    if (proposal.reject_reason == "geometry_threshold")
+        return "geometric_reject";
+    if (proposal.reject_reason.empty())
+        return "geometric_reject";
+    return proposal.reject_reason;
+}
+
 }  // namespace
 
 PoseGraph::PoseGraph()
@@ -126,6 +144,14 @@ void PoseGraph::registerPub(rclcpp::Node::SharedPtr node){
     pub_trajectory = node->create_publisher<nav_msgs::msg::Path>("/ov_slam/trajectory", 1000);
     pub_previous_pose_nodes = node->create_publisher<visualization_msgs::msg::MarkerArray>(
         "/ov_slam/previous_pose_nodes", 10);
+    pub_accepted_intra_session_loop_edges = node->create_publisher<visualization_msgs::msg::MarkerArray>(
+        "/ov_slam/accepted_intra_session_loop_edges", 10);
+    pub_accepted_inter_session_loop_edges = node->create_publisher<visualization_msgs::msg::MarkerArray>(
+        "/ov_slam/accepted_inter_session_loop_edges", 10);
+    pub_rejected_intra_session_loop_edges = node->create_publisher<visualization_msgs::msg::MarkerArray>(
+        "/ov_slam/rejected_intra_session_loop_edges", 10);
+    pub_rejected_inter_session_loop_edges = node->create_publisher<visualization_msgs::msg::MarkerArray>(
+        "/ov_slam/rejected_inter_session_loop_edges", 10);
     pub_inter_session_loop_edges = node->create_publisher<visualization_msgs::msg::MarkerArray>(
         "/ov_slam/inter_session_loop_edges", 10);
 }
@@ -532,12 +558,16 @@ std::vector<LoopProposal> PoseGraph::detectLoop(KeyFrame* keyframe, int frame_in
         if (candidate_index >= max_frame_id_allowed)
         {
             proposal.reject_reason = "recent_keyframe";
+            KeyFrame* old_kf = getKeyFrame(candidate_index);
+            rememberRejectedLoopVisualizationUnlocked(keyframe, old_kf, "same_sequence_debug_filter");
             proposals.push_back(proposal);
             continue;
         }
         if (ret[i].Score <= MIN_SCORE)
         {
             proposal.reject_reason = "dbow_score_below_threshold";
+            KeyFrame* old_kf = getKeyFrame(candidate_index);
+            rememberRejectedLoopVisualizationUnlocked(keyframe, old_kf, "low_confidence");
             proposals.push_back(proposal);
             continue;
         }
@@ -580,7 +610,11 @@ std::vector<LoopProposal> PoseGraph::detectLoop(KeyFrame* keyframe, int frame_in
         const size_t proposal_index = proposals.size() - 1;
 
         if (!proposal.accepted())
+        {
+            rememberRejectedLoopVisualizationUnlocked(keyframe, old_kf,
+                                                     LoopVisualizationRejectReason(proposal));
             continue;
+        }
 
         if (loop_feat_num > strong_loop_feat_num)
         {
@@ -1518,8 +1552,42 @@ visualization_msgs::msg::Marker PoseGraph::makeDeleteAllMarker(const std::string
     return marker;
 }
 
+void PoseGraph::rememberRejectedLoopVisualizationUnlocked(KeyFrame *current, KeyFrame *target,
+                                                          const std::string &reason)
+{
+    if (current == nullptr || target == nullptr)
+    {
+        return;
+    }
+
+    LoopEdgeVisualizationRecord record;
+    record.current_index = current->index;
+    record.target_index = target->index;
+    record.current_sequence = current->sequence;
+    record.target_sequence = target->sequence;
+    record.current_point = KeyFrameCameraPoint(current);
+    record.target_point = KeyFrameCameraPoint(target);
+    record.reason = reason;
+    rejected_loop_visualization_records.push_back(record);
+    trimRejectedLoopVisualizationUnlocked();
+}
+
+void PoseGraph::trimRejectedLoopVisualizationUnlocked()
+{
+    while (rejected_loop_visualization_records.size() > kMaxRejectedLoopVisualizationRecords)
+    {
+        rejected_loop_visualization_records.pop_front();
+    }
+}
+
 void PoseGraph::publishInterSessionVisualizationUnlocked()
 {
+    size_t previous_pose_node_count = 0;
+    size_t accepted_intra_count = 0;
+    size_t accepted_inter_count = 0;
+    size_t rejected_intra_count = 0;
+    size_t rejected_inter_count = 0;
+
     if (pub_previous_pose_nodes)
     {
         visualization_msgs::msg::MarkerArray nodes_array;
@@ -1545,45 +1613,135 @@ void PoseGraph::publishInterSessionVisualizationUnlocked()
             }
             nodes.points.push_back(KeyFrameCameraPoint(keyframe));
         }
+        previous_pose_node_count = nodes.points.size();
 
         nodes_array.markers.push_back(nodes);
         pub_previous_pose_nodes->publish(nodes_array);
     }
 
-    if (pub_inter_session_loop_edges)
+    visualization_msgs::msg::Marker accepted_intra;
+    accepted_intra.header.frame_id = "global";
+    accepted_intra.ns = "accepted_intra_session_loop_edges";
+    accepted_intra.id = 1;
+    accepted_intra.type = visualization_msgs::msg::Marker::LINE_LIST;
+    accepted_intra.action = visualization_msgs::msg::Marker::ADD;
+    accepted_intra.pose.orientation.w = 1.0;
+    accepted_intra.scale.x = 0.055;
+    accepted_intra.color = MakeColor(1.0f, 0.85f, 0.05f, 0.95f);
+
+    visualization_msgs::msg::Marker accepted_inter;
+    accepted_inter.header.frame_id = "global";
+    accepted_inter.ns = "accepted_inter_session_loop_edges";
+    accepted_inter.id = 1;
+    accepted_inter.type = visualization_msgs::msg::Marker::LINE_LIST;
+    accepted_inter.action = visualization_msgs::msg::Marker::ADD;
+    accepted_inter.pose.orientation.w = 1.0;
+    accepted_inter.scale.x = 0.08;
+    accepted_inter.color = MakeColor(1.0f, 0.2f, 0.05f, 1.0f);
+
+    for (KeyFrame *keyframe : keyframelist)
     {
-        visualization_msgs::msg::MarkerArray edges_array;
-        edges_array.markers.push_back(makeDeleteAllMarker("inter_session_loop_edges"));
-
-        visualization_msgs::msg::Marker edges;
-        edges.header.frame_id = "global";
-        edges.ns = "inter_session_loop_edges";
-        edges.id = 1;
-        edges.type = visualization_msgs::msg::Marker::LINE_LIST;
-        edges.action = visualization_msgs::msg::Marker::ADD;
-        edges.pose.orientation.w = 1.0;
-        edges.scale.x = 0.08;
-        edges.color = MakeColor(1.0f, 0.2f, 0.05f, 1.0f);
-
-        for (KeyFrame *keyframe : keyframelist)
+        if (keyframe == nullptr || !keyframe->has_loop)
         {
-            if (keyframe == nullptr || !keyframe->has_loop)
-            {
-                continue;
-            }
-
-            KeyFrame *connected = getKeyFrame(keyframe->loop_index);
-            if (connected == nullptr || connected->sequence == keyframe->sequence)
-            {
-                continue;
-            }
-
-            edges.points.push_back(KeyFrameCameraPoint(keyframe));
-            edges.points.push_back(KeyFrameCameraPoint(connected));
+            continue;
         }
 
-        edges_array.markers.push_back(edges);
-        pub_inter_session_loop_edges->publish(edges_array);
+        KeyFrame *connected = getKeyFrame(keyframe->loop_index);
+        if (connected == nullptr)
+        {
+            continue;
+        }
+
+        auto &marker = (connected->sequence == keyframe->sequence) ? accepted_intra : accepted_inter;
+        marker.points.push_back(KeyFrameCameraPoint(keyframe));
+        marker.points.push_back(KeyFrameCameraPoint(connected));
+    }
+    accepted_intra_count = accepted_intra.points.size() / 2;
+    accepted_inter_count = accepted_inter.points.size() / 2;
+
+    visualization_msgs::msg::MarkerArray accepted_intra_array;
+    accepted_intra_array.markers.push_back(makeDeleteAllMarker(accepted_intra.ns));
+    accepted_intra_array.markers.push_back(accepted_intra);
+    if (pub_accepted_intra_session_loop_edges)
+    {
+        pub_accepted_intra_session_loop_edges->publish(accepted_intra_array);
+    }
+
+    visualization_msgs::msg::MarkerArray accepted_inter_array;
+    accepted_inter_array.markers.push_back(makeDeleteAllMarker(accepted_inter.ns));
+    accepted_inter_array.markers.push_back(accepted_inter);
+    if (pub_accepted_inter_session_loop_edges)
+    {
+        pub_accepted_inter_session_loop_edges->publish(accepted_inter_array);
+    }
+
+    if (pub_inter_session_loop_edges)
+    {
+        visualization_msgs::msg::Marker compatibility_inter = accepted_inter;
+        compatibility_inter.ns = "inter_session_loop_edges";
+        visualization_msgs::msg::MarkerArray compatibility_inter_array;
+        compatibility_inter_array.markers.push_back(makeDeleteAllMarker(compatibility_inter.ns));
+        compatibility_inter_array.markers.push_back(compatibility_inter);
+        pub_inter_session_loop_edges->publish(compatibility_inter_array);
+    }
+
+    visualization_msgs::msg::Marker rejected_intra;
+    rejected_intra.header.frame_id = "global";
+    rejected_intra.ns = "rejected_intra_session_loop_edges";
+    rejected_intra.id = 1;
+    rejected_intra.type = visualization_msgs::msg::Marker::LINE_LIST;
+    rejected_intra.action = visualization_msgs::msg::Marker::ADD;
+    rejected_intra.pose.orientation.w = 1.0;
+    rejected_intra.scale.x = 0.025;
+    rejected_intra.color = MakeColor(0.55f, 0.55f, 0.55f, 0.45f);
+
+    visualization_msgs::msg::Marker rejected_inter;
+    rejected_inter.header.frame_id = "global";
+    rejected_inter.ns = "rejected_inter_session_loop_edges";
+    rejected_inter.id = 1;
+    rejected_inter.type = visualization_msgs::msg::Marker::LINE_LIST;
+    rejected_inter.action = visualization_msgs::msg::Marker::ADD;
+    rejected_inter.pose.orientation.w = 1.0;
+    rejected_inter.scale.x = 0.035;
+    rejected_inter.color = MakeColor(0.75f, 0.25f, 1.0f, 0.55f);
+
+    for (const LoopEdgeVisualizationRecord &record : rejected_loop_visualization_records)
+    {
+        auto &marker = (record.current_sequence == record.target_sequence) ? rejected_intra : rejected_inter;
+        marker.points.push_back(record.current_point);
+        marker.points.push_back(record.target_point);
+    }
+    rejected_intra_count = rejected_intra.points.size() / 2;
+    rejected_inter_count = rejected_inter.points.size() / 2;
+
+    if (pub_rejected_intra_session_loop_edges)
+    {
+        visualization_msgs::msg::MarkerArray rejected_intra_array;
+        rejected_intra_array.markers.push_back(makeDeleteAllMarker(rejected_intra.ns));
+        rejected_intra_array.markers.push_back(rejected_intra);
+        pub_rejected_intra_session_loop_edges->publish(rejected_intra_array);
+    }
+
+    if (pub_rejected_inter_session_loop_edges)
+    {
+        visualization_msgs::msg::MarkerArray rejected_inter_array;
+        rejected_inter_array.markers.push_back(makeDeleteAllMarker(rejected_inter.ns));
+        rejected_inter_array.markers.push_back(rejected_inter);
+        pub_rejected_inter_session_loop_edges->publish(rejected_inter_array);
+    }
+
+    static auto last_loop_marker_diagnostic = std::chrono::steady_clock::time_point::min();
+    const auto now = std::chrono::steady_clock::now();
+    if (last_loop_marker_diagnostic == std::chrono::steady_clock::time_point::min() ||
+        now - last_loop_marker_diagnostic >= std::chrono::seconds(5))
+    {
+        printf("[POSEGRAPH]: loop marker edges accepted_intra=%zu accepted_inter=%zu rejected_intra=%zu rejected_inter=%zu previous_nodes=%zu\n",
+               accepted_intra_count,
+               accepted_inter_count,
+               rejected_intra_count,
+               rejected_inter_count,
+               previous_pose_node_count);
+        last_loop_marker_diagnostic = now;
     }
 }
 

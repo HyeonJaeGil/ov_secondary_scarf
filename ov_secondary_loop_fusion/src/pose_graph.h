@@ -12,6 +12,7 @@
 #pragma once
 
 #include <atomic>
+#include <deque>
 #include <map>
 #include <optional>
 #include <thread>
@@ -84,6 +85,17 @@ private:
 		FullCalibration
 	};
 
+	struct LoopEdgeVisualizationRecord
+	{
+		int current_index = -1;
+		int target_index = -1;
+		int current_sequence = -1;
+		int target_sequence = -1;
+		geometry_msgs::msg::Point current_point;
+		geometry_msgs::msg::Point target_point;
+		std::string reason;
+	};
+
 	std::vector<LoopProposal> detectLoop(KeyFrame* keyframe, int frame_index);
 	std::optional<LoopProposal> selectTopAcceptedLoopProposal(const std::vector<LoopProposal> &proposals) const;
 	void addKeyFrameIntoVoc(KeyFrame* keyframe);
@@ -95,11 +107,15 @@ private:
 	void updatePath();
 	void publishUnlocked();
 	void publishInterSessionVisualizationUnlocked();
+	void rememberRejectedLoopVisualizationUnlocked(KeyFrame *current, KeyFrame *target,
+	                                               const std::string &reason);
+	void trimRejectedLoopVisualizationUnlocked();
 	visualization_msgs::msg::Marker makeDeleteAllMarker(const std::string &ns) const;
 	void refreshKeyframeCalibrationUnlocked(const Eigen::Vector3d &_T_i_c, const Eigen::Matrix3d &_R_i_c,
 	                                        const camodocal::CameraPtr &_camera,
 	                                        CalibrationRefresh refresh);
 	list<KeyFrame*> keyframelist;
+	std::deque<LoopEdgeVisualizationRecord> rejected_loop_visualization_records;
 	std::mutex m_keyframelist;
 	std::mutex m_optimize_buf;
 	std::mutex m_path;
@@ -123,6 +139,10 @@ private:
 
 	rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pub_trajectory;
 	rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr pub_previous_pose_nodes;
+	rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr pub_accepted_intra_session_loop_edges;
+	rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr pub_accepted_inter_session_loop_edges;
+	rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr pub_rejected_intra_session_loop_edges;
+	rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr pub_rejected_inter_session_loop_edges;
 	rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr pub_inter_session_loop_edges;
 };
 
