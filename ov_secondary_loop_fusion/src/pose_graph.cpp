@@ -475,6 +475,7 @@ std::optional<LoopProposal> PoseGraph::selectTopAcceptedLoopProposal(const std::
 std::vector<LoopProposal> PoseGraph::detectLoop(KeyFrame* keyframe, int frame_index)
 {
     std::vector<LoopProposal> proposals;
+    rejected_loop_visualization_records.clear();
 
     // put image into image_pool; for visualization
     cv::Mat compressed_image;
