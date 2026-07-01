@@ -28,6 +28,7 @@
 namespace {
 
 constexpr size_t kMaxRejectedLoopVisualizationRecords = 2000;
+constexpr int kMaxLoopRetrievalResults = 20;
 
 nav_msgs::msg::Path BuildCameraTrajectoryMessage(const std::list<KeyFrame*> &keyframes)
 {
@@ -489,7 +490,7 @@ std::vector<LoopProposal> PoseGraph::detectLoop(KeyFrame* keyframe, int frame_in
     QueryResults ret;
     TicToc t_query;
     int max_frame_id_allowed = std::max(0, frame_index - RECALL_IGNORE_RECENT_COUNT);
-    db.query(keyframe->brief_descriptors, ret, 0, max_frame_id_allowed);
+    db.query(keyframe->brief_descriptors, ret, kMaxLoopRetrievalResults, max_frame_id_allowed);
     //printf("[POSEGRAPH]: query time: %f", t_query.toc());
     //cout << "Searching for Image " << frame_index << ". " << ret << endl;
 
