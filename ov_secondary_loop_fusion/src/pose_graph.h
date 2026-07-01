@@ -24,8 +24,10 @@
 #include <queue>
 #include <assert.h>
 #include <nav_msgs/msg/path.hpp>
+#include <visualization_msgs/msg/marker.hpp>
 #include <geometry_msgs/msg/point_stamped.hpp>
 #include <nav_msgs/msg/odometry.hpp>
+#include <visualization_msgs/msg/marker_array.hpp>
 #include <stdio.h>
 #include <rclcpp/node.hpp>
 #include "keyframe.h"
@@ -91,6 +93,9 @@ private:
 	void optimize4DoF();
 	void optimize6DoF();
 	void updatePath();
+	void publishUnlocked();
+	void publishInterSessionVisualizationUnlocked();
+	visualization_msgs::msg::Marker makeDeleteAllMarker(const std::string &ns) const;
 	void refreshKeyframeCalibrationUnlocked(const Eigen::Vector3d &_T_i_c, const Eigen::Matrix3d &_R_i_c,
 	                                        const camodocal::CameraPtr &_camera,
 	                                        CalibrationRefresh refresh);
@@ -117,6 +122,8 @@ private:
 	BriefVocabulary* voc;
 
 	rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pub_trajectory;
+	rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr pub_previous_pose_nodes;
+	rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr pub_inter_session_loop_edges;
 };
 
 template <typename T> inline

@@ -18,7 +18,10 @@
 #include <limits>
 #include <map>
 #include <sstream>
+#include <geometry_msgs/msg/point.hpp>
+#include <std_msgs/msg/color_rgba.hpp>
 #include <rclcpp/time.hpp>
+#include <visualization_msgs/msg/marker.hpp>
 
 
 namespace {
@@ -67,6 +70,33 @@ double HeaderStampSeconds(const builtin_interfaces::msg::Time &stamp)
     return rclcpp::Time(stamp).seconds();
 }
 
+geometry_msgs::msg::Point ToPointMsg(const Eigen::Vector3d &position)
+{
+    geometry_msgs::msg::Point point;
+    point.x = position.x();
+    point.y = position.y();
+    point.z = position.z();
+    return point;
+}
+
+std_msgs::msg::ColorRGBA MakeColor(float r, float g, float b, float a)
+{
+    std_msgs::msg::ColorRGBA color;
+    color.r = r;
+    color.g = g;
+    color.b = b;
+    color.a = a;
+    return color;
+}
+
+geometry_msgs::msg::Point KeyFrameCameraPoint(KeyFrame *keyframe)
+{
+    Eigen::Vector3d position;
+    Eigen::Matrix3d rotation;
+    keyframe->getCameraPose(position, rotation);
+    return ToPointMsg(position);
+}
+
 }  // namespace
 
 PoseGraph::PoseGraph()
@@ -94,6 +124,10 @@ PoseGraph::~PoseGraph()
 void PoseGraph::registerPub(rclcpp::Node::SharedPtr node){
 
     pub_trajectory = node->create_publisher<nav_msgs::msg::Path>("/ov_slam/trajectory", 1000);
+    pub_previous_pose_nodes = node->create_publisher<visualization_msgs::msg::MarkerArray>(
+        "/ov_slam/previous_pose_nodes", 10);
+    pub_inter_session_loop_edges = node->create_publisher<visualization_msgs::msg::MarkerArray>(
+        "/ov_slam/inter_session_loop_edges", 10);
 }
 
 void PoseGraph::setIMUFlag(bool _use_imu)
@@ -312,7 +346,7 @@ void PoseGraph::addKeyFrame(KeyFrame* cur_kf, bool flag_detect_loop)
         optimize_global_buf.push(false);
     }
     write_trajectory_to_bag(BuildCameraTrajectoryMessage(keyframelist));
-    publish();
+    publishUnlocked();
 	m_keyframelist.unlock();
 }
 
@@ -1079,7 +1113,7 @@ void PoseGraph::updatePath()
 
     }
     // write_trajectory_to_bag(BuildCameraTrajectoryMessage(keyframelist));
-    publish();
+    publishUnlocked();
     m_keyframelist.unlock();
 }
 
@@ -1474,8 +1508,95 @@ void PoseGraph::loadPoseGraph()
     base_sequence = 0;
 }
 
-void PoseGraph::publish()
+visualization_msgs::msg::Marker PoseGraph::makeDeleteAllMarker(const std::string &ns) const
+{
+    visualization_msgs::msg::Marker marker;
+    marker.header.frame_id = "global";
+    marker.ns = ns;
+    marker.id = 0;
+    marker.action = visualization_msgs::msg::Marker::DELETEALL;
+    return marker;
+}
+
+void PoseGraph::publishInterSessionVisualizationUnlocked()
+{
+    if (pub_previous_pose_nodes)
+    {
+        visualization_msgs::msg::MarkerArray nodes_array;
+        nodes_array.markers.push_back(makeDeleteAllMarker("previous_pose_nodes"));
+
+        visualization_msgs::msg::Marker nodes;
+        nodes.header.frame_id = "global";
+        nodes.ns = "previous_pose_nodes";
+        nodes.id = 1;
+        nodes.type = visualization_msgs::msg::Marker::SPHERE_LIST;
+        nodes.action = visualization_msgs::msg::Marker::ADD;
+        nodes.pose.orientation.w = 1.0;
+        nodes.scale.x = 0.18;
+        nodes.scale.y = 0.18;
+        nodes.scale.z = 0.18;
+        nodes.color = MakeColor(0.35f, 0.65f, 1.0f, 0.85f);
+
+        for (KeyFrame *keyframe : keyframelist)
+        {
+            if (keyframe == nullptr || keyframe->sequence != 0)
+            {
+                continue;
+            }
+            nodes.points.push_back(KeyFrameCameraPoint(keyframe));
+        }
+
+        nodes_array.markers.push_back(nodes);
+        pub_previous_pose_nodes->publish(nodes_array);
+    }
+
+    if (pub_inter_session_loop_edges)
+    {
+        visualization_msgs::msg::MarkerArray edges_array;
+        edges_array.markers.push_back(makeDeleteAllMarker("inter_session_loop_edges"));
+
+        visualization_msgs::msg::Marker edges;
+        edges.header.frame_id = "global";
+        edges.ns = "inter_session_loop_edges";
+        edges.id = 1;
+        edges.type = visualization_msgs::msg::Marker::LINE_LIST;
+        edges.action = visualization_msgs::msg::Marker::ADD;
+        edges.pose.orientation.w = 1.0;
+        edges.scale.x = 0.08;
+        edges.color = MakeColor(1.0f, 0.2f, 0.05f, 1.0f);
+
+        for (KeyFrame *keyframe : keyframelist)
+        {
+            if (keyframe == nullptr || !keyframe->has_loop)
+            {
+                continue;
+            }
+
+            KeyFrame *connected = getKeyFrame(keyframe->loop_index);
+            if (connected == nullptr || connected->sequence == keyframe->sequence)
+            {
+                continue;
+            }
+
+            edges.points.push_back(KeyFrameCameraPoint(keyframe));
+            edges.points.push_back(KeyFrameCameraPoint(connected));
+        }
+
+        edges_array.markers.push_back(edges);
+        pub_inter_session_loop_edges->publish(edges_array);
+    }
+}
+
+void PoseGraph::publishUnlocked()
 {
     if (pub_trajectory)
         pub_trajectory->publish(BuildCameraTrajectoryMessage(keyframelist));
+
+    publishInterSessionVisualizationUnlocked();
+}
+
+void PoseGraph::publish()
+{
+    std::lock_guard<std::mutex> lock(m_keyframelist);
+    publishUnlocked();
 }
