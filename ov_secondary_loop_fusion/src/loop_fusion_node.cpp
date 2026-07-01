@@ -23,6 +23,7 @@
 #include <filesystem>
 #include <algorithm>
 #include <iostream>
+#include <sstream>
 //#include <ros/package.h>
 #include <ament_index_cpp/get_package_share_directory.hpp>
 #include <mutex>
@@ -119,6 +120,14 @@ struct FinalizeResult
     std::string final_trajectory_path;
 };
 
+struct InputQueueSizes
+{
+    size_t image = 0;
+    size_t point = 0;
+    size_t pose = 0;
+    size_t odometry = 0;
+};
+
 using FinalizeOutputs = ov_secondary_loop_fusion::srv::FinalizeOutputs;
 
 void throw_serial_buffer_full(const char *buffer_name)
@@ -163,6 +172,32 @@ bool input_queues_empty()
 {
     std::lock_guard<std::mutex> lock(m_buf);
     return image_buf.empty() && point_buf.empty() && pose_buf.empty();
+}
+
+std::string input_queue_sizes_message(const InputQueueSizes &sizes)
+{
+    std::ostringstream stream;
+    stream << "image=" << sizes.image
+           << ", point=" << sizes.point
+           << ", pose=" << sizes.pose
+           << ", odometry=" << sizes.odometry;
+    return stream.str();
+}
+
+InputQueueSizes clear_residual_input_queues()
+{
+    std::lock_guard<std::mutex> lock(m_buf);
+    const InputQueueSizes sizes{
+        image_buf.size(), point_buf.size(), pose_buf.size(), odometry_buf.size()};
+    while (!image_buf.empty())
+        image_buf.pop();
+    while (!point_buf.empty())
+        point_buf.pop();
+    while (!pose_buf.empty())
+        pose_buf.pop();
+    while (!odometry_buf.empty())
+        odometry_buf.pop();
+    return sizes;
 }
 
 bool clear_unmatched_serial_input_tail()
@@ -294,11 +329,16 @@ FinalizeResult finalize_ov_slam_outputs(
     }
 
     finalize_lock.unlock();
+    std::string finalization_note;
     clear_unmatched_serial_input_tail();
     if (timeout_sec > 0.0 && !wait_for_input_queues_empty(timeout_sec))
     {
-        result.message = "Timed out waiting for loop fusion input queues to drain";
-        return result;
+        const InputQueueSizes residual_queue_sizes = clear_residual_input_queues();
+        finalization_note = " after clearing residual input queues (" +
+            input_queue_sizes_message(residual_queue_sizes) + ")";
+        printf("[POSEGRAPH]: finalize service timed out waiting for input queues; "
+               "cleared residual inputs (%s)\n",
+               input_queue_sizes_message(residual_queue_sizes).c_str());
     }
 
     if (run_final_optimization)
@@ -339,7 +379,8 @@ FinalizeResult finalize_ov_slam_outputs(
     if (close_bag)
         outputs_finalized = true;
     result.success = true;
-    result.message = close_bag ? "OV-SLAM outputs finalized" : "OV-SLAM pose graph saved";
+    result.message = close_bag ? "OV-SLAM outputs finalized" + finalization_note
+                               : "OV-SLAM pose graph saved" + finalization_note;
     return result;
 }
 
