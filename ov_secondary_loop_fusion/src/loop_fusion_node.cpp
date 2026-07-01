@@ -108,6 +108,7 @@ bool has_image_arrival = false;
 std::chrono::steady_clock::time_point last_image_arrival;
 rclcpp::TimerBase::SharedPtr image_inactive_timer;
 std::mutex finalize_mutex;
+bool finalization_started = false;
 bool outputs_finalized = false;
 
 struct FinalizeResult
@@ -309,6 +310,14 @@ void save_pose_graph_outputs(bool include_bag_trajectory)
     posegraph.saveFinalTrajectoryTum(final_trajectory_tum_path());
 }
 
+bool finalization_in_progress_or_complete()
+{
+    std::unique_lock<std::mutex> lock(finalize_mutex, std::try_to_lock);
+    if (!lock.owns_lock())
+        return true;
+    return finalization_started || outputs_finalized;
+}
+
 FinalizeResult finalize_ov_slam_outputs(
     bool run_final_optimization,
     bool close_bag,
@@ -333,6 +342,14 @@ FinalizeResult finalize_ov_slam_outputs(
         result.message = "OV-SLAM outputs already finalized";
         return result;
     }
+
+    if (finalization_started)
+    {
+        result.message = "OV-SLAM output finalization already in progress";
+        return result;
+    }
+
+    finalization_started = true;
 
     std::string finalization_note;
     clear_unmatched_serial_input_tail();
@@ -527,7 +544,7 @@ void App::intrinsics_callback(const sensor_msgs::msg::CameraInfo::SharedPtr msg)
 
 void process()
 {
-    while (true)
+    while (rclcpp::ok())
     {
         sensor_msgs::msg::CompressedImage::ConstSharedPtr image_msg = NULL;
         sensor_msgs::msg::PointCloud::ConstSharedPtr point_msg = NULL;
@@ -706,7 +723,7 @@ void process()
 
 void command()
 {
-    while(1)
+    while (rclcpp::ok())
     {
         char c = getchar();
         if (c == 's')
@@ -797,9 +814,15 @@ int main(int argc, char **argv)
             if (!has_image_arrival || pose_graph_auto_saved)
                 return;
 
+            if (finalization_in_progress_or_complete())
+                return;
+
             const auto now = std::chrono::steady_clock::now();
             const auto idle = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_image_arrival);
             if (idle.count() < 5000)
+                return;
+
+            if (finalization_in_progress_or_complete())
                 return;
 
             bool input_queues_empty = false;
@@ -833,6 +856,9 @@ int main(int argc, char **argv)
             if (!input_queues_empty || posegraph.isOptimizationRunning())
                 return;
 
+            if (finalization_in_progress_or_complete())
+                return;
+
             if (!m_process.try_lock())
                 return;
             const bool final_optimization_requested = posegraph.requestGlobalOptimization();
@@ -848,6 +874,9 @@ int main(int argc, char **argv)
             const bool input_queues_still_empty = image_buf.empty() && point_buf.empty() && pose_buf.empty();
             m_buf.unlock();
             if (!input_queues_still_empty || posegraph.hasPendingOptimization() || posegraph.isOptimizationRunning())
+                return;
+
+            if (finalization_in_progress_or_complete())
                 return;
 
             const FinalizeResult finalize_result =
@@ -1049,6 +1078,7 @@ int main(int argc, char **argv)
 
     measurement_process = std::thread(process);
     keyboard_command_process = std::thread(command);
+    keyboard_command_process.detach();
     
     RCLCPP_INFO_STREAM(nh->get_logger(), "loop_fusion_node ready");
     rclcpp::spin(nh);
@@ -1061,6 +1091,8 @@ int main(int argc, char **argv)
             "shutdown finalization did not complete: "
                 << shutdown_finalize_result.message);
     }
+    if (measurement_process.joinable())
+        measurement_process.join();
 
     return 0;
 }
