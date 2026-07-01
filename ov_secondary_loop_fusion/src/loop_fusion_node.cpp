@@ -19,6 +19,7 @@
 #include <sensor_msgs/msg/point_cloud.hpp>
 #include <sensor_msgs/msg/camera_info.hpp>
 #include <std_msgs/msg/bool.hpp>
+#include <ov_secondary_loop_fusion/srv/finalize_outputs.hpp>
 #include <filesystem>
 #include <algorithm>
 #include <iostream>
@@ -105,6 +106,20 @@ bool pose_graph_auto_saved = false;
 bool has_image_arrival = false;
 std::chrono::steady_clock::time_point last_image_arrival;
 rclcpp::TimerBase::SharedPtr image_inactive_timer;
+std::mutex finalize_mutex;
+bool outputs_finalized = false;
+
+struct FinalizeResult
+{
+    bool success = false;
+    std::string message;
+    std::string pose_graph_path;
+    std::string bag_path;
+    std::string metadata_path;
+    std::string final_trajectory_path;
+};
+
+using FinalizeOutputs = ov_secondary_loop_fusion::srv::FinalizeOutputs;
 
 void throw_serial_buffer_full(const char *buffer_name)
 {
@@ -118,6 +133,93 @@ void throw_serial_buffer_full(const char *buffer_name)
 std::string final_trajectory_tum_path()
 {
     return (std::filesystem::path(OUTPUT_PATH) / "ov_slam" / "trajectory_final.txt").string();
+}
+
+std::string pose_graph_txt_path()
+{
+    return (std::filesystem::path(POSE_GRAPH_SAVE_PATH) / "pose_graph.txt").string();
+}
+
+std::string ov_slam_bag_path()
+{
+    return (std::filesystem::path(OUTPUT_PATH) / "ov_slam" / "ov_slam_bag").string();
+}
+
+std::string ov_slam_metadata_path()
+{
+    return (std::filesystem::path(ov_slam_bag_path()) / "metadata.yaml").string();
+}
+
+bool file_nonempty(const std::string &path)
+{
+    std::error_code ec;
+    if (!std::filesystem::exists(path, ec) || !std::filesystem::is_regular_file(path, ec))
+        return false;
+    const auto size = std::filesystem::file_size(path, ec);
+    return !ec && size > 0;
+}
+
+bool input_queues_empty()
+{
+    std::lock_guard<std::mutex> lock(m_buf);
+    return image_buf.empty() && point_buf.empty() && pose_buf.empty();
+}
+
+bool clear_unmatched_serial_input_tail()
+{
+    if (!SERIAL_PROCESSING)
+        return false;
+
+    m_buf.lock();
+    const bool queues_empty = image_buf.empty() && point_buf.empty() && pose_buf.empty();
+    const bool serial_incomplete_tail = !queues_empty &&
+        (image_buf.empty() || point_buf.empty() || pose_buf.empty());
+    if (!serial_incomplete_tail)
+    {
+        m_buf.unlock();
+        return false;
+    }
+
+    if (!m_process.try_lock())
+    {
+        m_buf.unlock();
+        return false;
+    }
+    const size_t image_queue_size = image_buf.size();
+    const size_t point_queue_size = point_buf.size();
+    const size_t pose_queue_size = pose_buf.size();
+    while (!image_buf.empty())
+        image_buf.pop();
+    while (!point_buf.empty())
+        point_buf.pop();
+    while (!pose_buf.empty())
+        pose_buf.pop();
+    m_process.unlock();
+    m_buf.unlock();
+    printf("[POSEGRAPH]: cleared unmatched serial input tail before finalization "
+           "(image: %zu, point: %zu, pose: %zu)\n",
+           image_queue_size, point_queue_size, pose_queue_size);
+    return true;
+}
+
+bool wait_for_input_queues_empty(double timeout_sec)
+{
+    if (timeout_sec <= 0.0)
+        return input_queues_empty();
+
+    const auto start = std::chrono::steady_clock::now();
+    while (true)
+    {
+        if (input_queues_empty())
+            return true;
+
+        const auto elapsed = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - start).count();
+        if (elapsed >= timeout_sec)
+            return false;
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
 }
 
 std::string trim_copy(const std::string &value)
@@ -170,6 +272,75 @@ void save_pose_graph_outputs(bool include_bag_trajectory)
     if (include_bag_trajectory)
         posegraph.writeFinalTrajectoryToBag();
     posegraph.saveFinalTrajectoryTum(final_trajectory_tum_path());
+}
+
+FinalizeResult finalize_ov_slam_outputs(
+    bool run_final_optimization,
+    bool close_bag,
+    double timeout_sec)
+{
+    std::unique_lock<std::mutex> finalize_lock(finalize_mutex);
+    FinalizeResult result;
+    result.pose_graph_path = pose_graph_txt_path();
+    result.bag_path = ov_slam_bag_path();
+    result.metadata_path = ov_slam_metadata_path();
+    result.final_trajectory_path = final_trajectory_tum_path();
+
+    if (outputs_finalized)
+    {
+        result.success = true;
+        result.message = "OV-SLAM outputs already finalized";
+        return result;
+    }
+
+    finalize_lock.unlock();
+    clear_unmatched_serial_input_tail();
+    if (timeout_sec > 0.0 && !wait_for_input_queues_empty(timeout_sec))
+    {
+        result.message = "Timed out waiting for loop fusion input queues to drain";
+        return result;
+    }
+
+    if (run_final_optimization)
+    {
+        bool final_optimization_requested = false;
+        m_process.lock();
+        final_optimization_requested = posegraph.requestGlobalOptimization();
+        m_process.unlock();
+
+        if (final_optimization_requested)
+            posegraph.waitForOptimizationIdle();
+    }
+
+    m_process.lock();
+    save_pose_graph_outputs(true);
+    m_process.unlock();
+
+    if (close_bag)
+        close_bag_writer();
+
+    if (!file_nonempty(result.pose_graph_path))
+    {
+        result.message = "Missing or empty pose graph: " + result.pose_graph_path;
+        return result;
+    }
+    if (!file_nonempty(result.final_trajectory_path))
+    {
+        result.message = "Missing or empty final trajectory: " + result.final_trajectory_path;
+        return result;
+    }
+    if (close_bag && !file_nonempty(result.metadata_path))
+    {
+        result.message = "Missing or empty rosbag metadata: " + result.metadata_path;
+        return result;
+    }
+
+    finalize_lock.lock();
+    if (close_bag)
+        outputs_finalized = true;
+    result.success = true;
+    result.message = close_bag ? "OV-SLAM outputs finalized" : "OV-SLAM pose graph saved";
+    return result;
 }
 
 camodocal::CameraPtr camera_from_info(const sensor_msgs::msg::CameraInfo &msg)
@@ -545,10 +716,34 @@ int main(int argc, char **argv)
             if (!msg->data) {
                 return;
             }
+            // Compatibility path: save pose graph without closing the bag writer.
             m_process.lock();
             save_pose_graph_outputs(false);
             m_process.unlock();
             printf("[POSEGRAPH]: save pose graph finish\n");
+        });
+
+    auto finalize_service = nh->create_service<FinalizeOutputs>(
+        "/finalize_ov_slam_outputs",
+        [nh](const std::shared_ptr<FinalizeOutputs::Request> request,
+             std::shared_ptr<FinalizeOutputs::Response> response) {
+            const FinalizeResult result = finalize_ov_slam_outputs(
+                request->run_final_optimization,
+                true,
+                request->timeout_sec);
+
+            response->success = result.success;
+            response->message = result.message;
+            response->pose_graph_path = result.pose_graph_path;
+            response->bag_path = result.bag_path;
+            response->metadata_path = result.metadata_path;
+            response->final_trajectory_path = result.final_trajectory_path;
+
+            if (result.success && request->shutdown_after_finalize)
+            {
+                RCLCPP_INFO(nh->get_logger(), "finalize service requested shutdown");
+                rclcpp::shutdown();
+            }
         });
 
     image_inactive_timer = nh->create_wall_timer(
@@ -610,11 +805,13 @@ int main(int argc, char **argv)
             if (!input_queues_still_empty || posegraph.hasPendingOptimization() || posegraph.isOptimizationRunning())
                 return;
 
-            if (!m_process.try_lock())
+            const FinalizeResult finalize_result =
+                finalize_ov_slam_outputs(false, true, 0.0);
+            if (!finalize_result.success)
+            {
+                printf("[POSEGRAPH]: autosave skipped: %s\n", finalize_result.message.c_str());
                 return;
-            save_pose_graph_outputs(true);
-            m_process.unlock();
-            close_bag_writer();
+            }
             pose_graph_auto_saved = true;
             printf("[POSEGRAPH]: auto-saved pose graph and closed bag writer after 5s idle with no pending optimization\n");
         });
@@ -810,10 +1007,15 @@ int main(int argc, char **argv)
     
     RCLCPP_INFO_STREAM(nh->get_logger(), "loop_fusion_node ready");
     rclcpp::spin(nh);
-    m_process.lock();
-    save_pose_graph_outputs(true);
-    m_process.unlock();
-    close_bag_writer();
+    const FinalizeResult shutdown_finalize_result =
+        finalize_ov_slam_outputs(true, true, 0.0);
+    if (!shutdown_finalize_result.success)
+    {
+        RCLCPP_WARN_STREAM(
+            nh->get_logger(),
+            "shutdown finalization did not complete: "
+                << shutdown_finalize_result.message);
+    }
 
     return 0;
 }
